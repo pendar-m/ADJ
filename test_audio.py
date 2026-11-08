@@ -1,4 +1,3 @@
-
 import time
 
 from audio.audio_loader import load_audio
@@ -6,80 +5,155 @@ from audio.audio_mixer import DualDeckMixer
 
 from analysis.bpm_detector import detect_bpm
 from analysis.beat_matcher import BeatMatcher
+from analysis.beat_aligner import BeatAligner
 
 
-# 1. Load both tracks
+# -------------------------
+# Load Tracks
+# -------------------------
 
-audio_a, sr_a = load_audio(
-    "Olly Alexander (Years   Years) - Desire (Gryffin Remix).mp3"
+track_a, sr_a = load_audio(
+    "Calvin Harris - Feel So Close (Radio Edit).mp3"
 )
 
-audio_b, sr_b = load_audio("Calvin Harris - Summer.mp3")
+track_b, sr_b = load_audio(
+    "David Guetta - Titanium (feat. Sia).mp3"
+)
+
+print("\nTracks loaded successfully.")
 
 
-# 2. Detect BPM
+# -------------------------
+# Detect BPM
+# -------------------------
 
-bpm_a = detect_bpm(audio_a, sr_a)["bpm"]
-bpm_b = detect_bpm(audio_b, sr_b)["bpm"]
+analysis_a = detect_bpm(track_a, sr_a)
+analysis_b = detect_bpm(track_b, sr_b)
 
-print("Track A BPM:", bpm_a)
-print("Track B BPM:", bpm_b)
+bpm_a = analysis_a["bpm"]
+bpm_b = analysis_b["bpm"]
+
+beats_a = analysis_a["beat_times"]
+beats_b = analysis_b["beat_times"]
+
+print("\nBPM Analysis:")
+print("Track A:", bpm_a)
+print("Track B:", bpm_b)
 
 
-# 3. Calculate tempo adjustment
+# -------------------------
+# Calculate Tempo Match
+# -------------------------
 
 matcher = BeatMatcher()
 
-result = matcher.analyze(
-    source_bpm=bpm_b,
-    target_bpm=bpm_a
+match_result = matcher.analyze(
+    bpm_b,
+    bpm_a
 )
 
-print("\nBeat Matching Analysis:")
-print(result)
+print("\nTempo Match:")
+print(match_result)
 
-if not result["can_match"]:
-    raise ValueError("Tempo difference is too large for matching.")
+if not match_result["can_match"]:
+    raise ValueError("Tempo difference is too large.")
 
 
-# 4. Adjust Track B tempo
+# -------------------------
+# Adjust Track B Tempo
+# -------------------------
+
+tempo_ratio = match_result["tempo_ratio"]
 
 mixer = DualDeckMixer()
 
-adjusted_audio_b = mixer.adjust_tempo(
-    audio_b,
-    result["tempo_ratio"]
+adjusted_b = mixer.adjust_tempo(
+    track_b,
+    tempo_ratio
 )
 
 print("\nTempo adjustment completed.")
-print("Adjusted Track B shape:", adjusted_audio_b.shape)
 
 
-# 5. Play both tracks
+# -------------------------
+# Beat Alignment
+# -------------------------
+
+aligner = BeatAligner()
+
+# Track B's beat times must be converted
+# into the adjusted audio's time scale.
+
+adjusted_beats_b = beats_b / tempo_ratio
+
+alignment = aligner.align(
+    beats_a,
+    adjusted_beats_b
+)
+
+cue_a = alignment["cue_a"]
+cue_b = alignment["cue_b"]
+
+print("\nBeat Alignment:")
+print(alignment)
+
+
+# -------------------------
+# Trim Audio
+# -------------------------
+
+prepared_a = aligner.trim_audio(
+    track_a,
+    sr_a,
+    cue_a
+)
+
+prepared_b = aligner.trim_audio(
+    adjusted_b,
+    sr_b,
+    cue_b
+)
+
+print("\nAudio prepared.")
+
+
+# -------------------------
+# Start Mixer
+# -------------------------
 
 mixer.set_crossfader(0.0)
 
 mixer.play(
-    audio_a,
+    prepared_a,
     sr_a,
-    adjusted_audio_b,
+    prepared_b,
     sr_b
 )
 
-print("\nPlaying Track A only...")
+print("\nPlayback started.")
+
+
+# -------------------------
+# Crossfade Test
+# -------------------------
+
 time.sleep(5)
 
-print("Crossfading to both tracks...")
-mixer.set_crossfader(0.5)
-time.sleep(10)
+print("Starting smooth crossfade...")
 
-print("Playing Track B only...")
-mixer.set_crossfader(1.0)
+mixer.smooth_crossfade(
+    target=1.0,
+    duration=16.0
+)
 
-# Wait until both tracks finish
-while any(mixer.active):
-    time.sleep(0.5)
+
+# -------------------------
+# Wait Until Finished
+# -------------------------
+
+while mixer.is_playing():
+    time.sleep(0.1)
+
+print("\nPlayback finished.")
 
 mixer.stop()
-
-print("\nTest completed.")
