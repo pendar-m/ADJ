@@ -1,9 +1,9 @@
-import time
+
+import threading
 
 import numpy as np
 import sounddevice as sd
 import librosa
-import threading
 
 
 class DualDeckMixer:
@@ -19,12 +19,18 @@ class DualDeckMixer:
         self._positions = [0, 0]
         self._deck_active = [False, False]
 
-        self._trim_gains = (1.0, 1.0)
-        self._crossfader = 0.0
-        self._target_gains = (1.0, 0.0)
-        self._current_gains = [1.0, 0.0]
+        self._trim_gains = [1.0, 1.0]
 
+        self._crossfader = 0.0
+        self._ramp_start = 0.0
+        self._ramp_target = 0.0
+
+        self._ramp_total_frames = 0
+        self._ramp_progress = 0
+
+        self._control_lock = threading.Lock()
         self._finished = threading.Event()
+
         self._active = False
 
     # -------------------------
@@ -39,18 +45,21 @@ class DualDeckMixer:
             audio_data = np.stack([audio_data, audio_data])
 
         elif audio_data.ndim == 2:
+
             if audio_data.shape[0] == 1:
                 audio_data = np.repeat(audio_data, 2, axis=0)
 
             elif audio_data.shape[0] != 2:
-                raise ValueError("Only mono and stereo audio are supported.")
+                raise ValueError(
+                    "Only mono and stereo audio are supported."
+                )
 
         else:
             raise ValueError("Unsupported audio shape.")
 
         if original_sr != self.sample_rate:
 
-            resampled_channels = []
+            channels = []
 
             for channel in audio_data:
 
@@ -60,14 +69,14 @@ class DualDeckMixer:
                     target_sr=self.sample_rate
                 )
 
-                resampled_channels.append(resampled)
+                channels.append(resampled)
 
-            audio_data = np.stack(resampled_channels)
+            audio_data = np.stack(channels)
 
-        # Convert from (channels, samples) to (samples, channels)
-        audio_data = audio_data.T
-
-        return np.ascontiguousarray(audio_data, dtype=np.float32)
+        return np.ascontiguousarray(
+            audio_data.T,
+            dtype=np.float32
+        )
 
     # -------------------------
     # Playback
@@ -80,6 +89,9 @@ class DualDeckMixer:
         deck_a = self._prepare_audio(audio_a, sr_a)
         deck_b = self._prepare_audio(audio_b, sr_b)
 
+        if len(deck_a) == 0 or len(deck_b) == 0:
+            raise ValueError("Audio tracks cannot be empty.")
+
         self._decks = [deck_a, deck_b]
 
         self._positions = [0, 0]
@@ -87,7 +99,15 @@ class DualDeckMixer:
 
         self._finished.clear()
 
-        self._current_gains = list(self._target_gains)
+        with self._control_lock:
+
+            self._crossfader = 0.0
+            self._ramp_start = 0.0
+            self._ramp_target = 0.0
+
+            self._ramp_total_frames = 0
+            self._ramp_progress = 0
+
         self._active = True
 
         try:
@@ -108,10 +128,82 @@ class DualDeckMixer:
             self._finished.set()
 
             if self._stream is not None:
+
                 self._stream.close()
                 self._stream = None
 
             raise
+
+    # -------------------------
+    # Crossfade Processing
+    # -------------------------
+
+    @staticmethod
+    def _calculate_gains(crossfader):
+
+        angle = crossfader * (np.pi / 2)
+
+        gain_a = np.cos(angle)
+        gain_b = np.sin(angle)
+
+        return gain_a, gain_b
+
+    def _get_gain_curves(self, frames):
+
+        with self._control_lock:
+
+            start = self._ramp_progress
+            total = self._ramp_total_frames
+
+            ramp_start = self._ramp_start
+            ramp_target = self._ramp_target
+
+            trims = tuple(self._trim_gains)
+
+            if total <= 0:
+
+                values = np.full(
+                    frames,
+                    self._crossfader,
+                    dtype=np.float32
+                )
+
+            else:
+
+                positions = np.minimum(
+                    np.arange(start + 1, start + frames + 1),
+                    total
+                )
+
+                progress = positions / total
+
+                # Smoothstep easing
+                progress = (
+                    3 * progress ** 2
+                    - 2 * progress ** 3
+                )
+
+                values = (
+                    ramp_start
+                    + (ramp_target - ramp_start) * progress
+                ).astype(np.float32)
+
+                self._ramp_progress = min(
+                    start + frames,
+                    total
+                )
+
+                if self._ramp_progress >= total:
+
+                    self._crossfader = ramp_target
+                    self._ramp_total_frames = 0
+
+        angle = values * (np.pi / 2)
+
+        gain_a = np.cos(angle) * trims[0]
+        gain_b = np.sin(angle) * trims[1]
+
+        return gain_a, gain_b
 
     # -------------------------
     # Audio Callback
@@ -124,9 +216,9 @@ class DualDeckMixer:
         if not self._active:
             raise sd.CallbackStop
 
-        mixed_audio = np.zeros((frames, 2), dtype=np.float32)
+        gain_a, gain_b = self._get_gain_curves(frames)
 
-        target_gains = self._target_gains
+        gains = (gain_a, gain_b)
 
         for deck_index in range(2):
 
@@ -145,23 +237,14 @@ class DualDeckMixer:
 
             chunk_size = min(frames, remaining)
 
-            audio_chunk = deck[
+            chunk = deck[
                 position:position + chunk_size
             ]
 
-            start_gain = self._current_gains[deck_index]
-            end_gain = target_gains[deck_index]
-
-            gain_curve = np.linspace(
-                start_gain,
-                end_gain,
-                frames,
-                endpoint=True,
-                dtype=np.float32
-            )
-
-            mixed_audio[:chunk_size] += (
-                audio_chunk * gain_curve[:chunk_size, np.newaxis]
+            outdata[:chunk_size] += (
+                chunk * gains[deck_index][
+                    :chunk_size, np.newaxis
+                ]
             )
 
             self._positions[deck_index] += chunk_size
@@ -169,15 +252,11 @@ class DualDeckMixer:
             if self._positions[deck_index] >= len(deck):
                 self._deck_active[deck_index] = False
 
-        self._current_gains = list(target_gains)
-
-        # Prevent digital clipping while preserving normal levels.
-        peak = np.max(np.abs(mixed_audio))
+        # Prevent digital clipping
+        peak = np.max(np.abs(outdata))
 
         if peak > 0.98:
-            mixed_audio *= 0.98 / peak
-
-        outdata[:] = mixed_audio
+            outdata *= 0.98 / peak
 
         if not any(self._deck_active):
 
@@ -187,28 +266,59 @@ class DualDeckMixer:
             raise sd.CallbackStop
 
     # -------------------------
-    # Gain Control
+    # Crossfader Control
     # -------------------------
 
-    def _update_target_gains(self):
-
-        angle = self._crossfader * (np.pi / 2)
-
-        crossfade_a = np.cos(angle)
-        crossfade_b = np.sin(angle)
-
-        gain_a = crossfade_a * self._trim_gains[0]
-        gain_b = crossfade_b * self._trim_gains[1]
-
-        self._target_gains = (gain_a, gain_b)
-
-    def set_crossfader(self, value):
+    def set_crossfader(self, value, duration=0.0):
 
         value = float(np.clip(value, 0.0, 1.0))
 
-        self._crossfader = value
+        with self._control_lock:
 
-        self._update_target_gains()
+            current = self._crossfader
+
+            if self._ramp_total_frames > 0:
+
+                progress = min(
+                    self._ramp_progress / self._ramp_total_frames,
+                    1.0
+                )
+
+                progress = (
+                    3 * progress ** 2
+                    - 2 * progress ** 3
+                )
+
+                current = (
+                    self._ramp_start
+                    + (self._ramp_target - self._ramp_start)
+                    * progress
+                )
+
+            self._ramp_start = current
+            self._ramp_target = value
+            self._ramp_progress = 0
+
+            self._ramp_total_frames = max(
+                0,
+                int(duration * self.sample_rate)
+            )
+
+            if self._ramp_total_frames == 0:
+
+                self._crossfader = value
+                self._ramp_start = value
+
+    def smooth_crossfade(self, target, duration=10.0):
+
+        self.set_crossfader(
+            value=target,
+            duration=duration
+        )
+
+    # -------------------------
+    # Deck Gain
+    # -------------------------
 
     def set_gain(self, deck_index, gain):
 
@@ -217,27 +327,28 @@ class DualDeckMixer:
 
         gain = float(max(0.0, gain))
 
-        gains = list(self._trim_gains)
-        gains[deck_index] = gain
-
-        self._trim_gains = tuple(gains)
-
-        self._update_target_gains()
+        with self._control_lock:
+            self._trim_gains[deck_index] = gain
 
     # -------------------------
-    # Tempo Adjustment
+    # Offline Tempo Adjustment
     # -------------------------
 
     def adjust_tempo(self, audio_data, tempo_ratio):
 
         if tempo_ratio <= 0:
-            raise ValueError("Tempo ratio must be greater than zero.")
+            raise ValueError(
+                "Tempo ratio must be greater than zero."
+            )
 
-        audio_data = np.asarray(audio_data, dtype=np.float32)
+        audio_data = np.asarray(
+            audio_data,
+            dtype=np.float32
+        )
 
         if audio_data.ndim == 1:
 
-            adjusted_audio = librosa.effects.time_stretch(
+            adjusted = librosa.effects.time_stretch(
                 audio_data,
                 rate=tempo_ratio
             )
@@ -255,13 +366,13 @@ class DualDeckMixer:
 
                 adjusted_channels.append(adjusted_channel)
 
-            adjusted_audio = np.stack(adjusted_channels)
+            adjusted = np.stack(adjusted_channels)
 
         else:
             raise ValueError("Unsupported audio shape.")
 
         return np.ascontiguousarray(
-            adjusted_audio,
+            adjusted,
             dtype=np.float32
         )
 
@@ -291,9 +402,9 @@ class DualDeckMixer:
 
     def stop(self):
 
-        stream = self._stream
-
         self._active = False
+
+        stream = self._stream
 
         if stream is not None:
 
@@ -311,29 +422,3 @@ class DualDeckMixer:
 
         self._deck_active = [False, False]
         self._finished.set()
-    def smooth_crossfade(self, target, duration=10.0):
-
-        target = float(np.clip(target, 0.0, 1.0))
-
-        if duration <= 0:
-            self.set_crossfader(target)
-            return
-
-        start = self._crossfader
-        steps = max(1, int(duration * 30))
-
-        for step in range(1, steps + 1):
-
-            progress = step / steps
-
-            # Smooth easing curve
-            progress = (
-                3 * progress ** 2
-                - 2 * progress ** 3
-            )
-
-            value = start + (target - start) * progress
-
-            self.set_crossfader(value)
-
-            time.sleep(duration / steps)
